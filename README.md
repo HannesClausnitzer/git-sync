@@ -11,18 +11,20 @@ A lightweight, power-conscious helper to auto-commit and push tracked directorie
 - Systemd integration for background operation
 
 ## Install
-1) Make the script executable:
-  ```sh
-  chmod +x sync.py
-  ```
-2) Optional: install a user-level systemd timer with the provided script (also installs a `gitsync` shim to `~/.local/bin` by default):
-  ```sh
-  chmod +x install.sh
-  INTERVAL_MINUTES=5 ./install.sh
-  systemctl --user daemon-reload
-  systemctl --user enable --now git-sync.timer
-  ```
-  Ensure your chosen `BIN_DIR` (default `~/.local/bin`) is on PATH to run commands with `gitsync`.
+Recommended (uses install.sh, sets up systemd timer, and installs `gitsync` shim):
+```sh
+chmod +x install.sh
+INTERVAL_MINUTES=5 ./install.sh
+systemctl --user daemon-reload
+systemctl --user enable --now git-sync.timer
+```
+Ensure your chosen `BIN_DIR` (default `~/.local/bin`) is on PATH to run commands with `gitsync`.
+
+Minimal (no timer/shim; run manually):
+```sh
+chmod +x sync.py
+./sync.py run --once
+```
 
 ## Configure directories
 - Add a directory (after install you can use `gitsync` instead of `./sync.py`):
