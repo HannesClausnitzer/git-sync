@@ -1,0 +1,2 @@
+# git-sync requires no external dependencies
+# All imports use Python standard library
