@@ -1,84 +1,70 @@
 # git-sync
 
-A lightweight, power-conscious helper to auto-commit and push tracked directories every few minutes. Config is stored at `~/.config/git-sync/config.json`.
+A lightweight helper that automatically commits and pushes one or more local directories to a Git remote over SSH.
 
-## Features
+## What a background auto-sync tool should have
 
-- Automatic git initialization for new directories
-- Configurable commit messages and branches
-- Power-efficient: skips work when idle or offline
-- No external dependencies (uses standard library)
-- Systemd integration for background operation
+- **Per-repo config**: path, remote, branch, push on/off, commit message
+- **Safe background operation**: single-instance lock, optional daemon mode, pid/log files, graceful shutdown
+- **SSH-first connectivity checks**: don’t try to push when the SSH endpoint is unreachable
+- **Correct push behavior**: fetch/rebase to avoid non-fast-forward pushes; push even if there are no new file changes (e.g. previously-offline commits)
+- **Low overhead**: do nothing when idle; short timeouts for git operations
+- **Clear logs**: enough output to understand what happened on each run
 
-## Install
-Recommended (uses install.sh, sets up systemd timer, and installs `gitsync` shim):
-```sh
-chmod +x install.sh
-INTERVAL_MINUTES=5 ./install.sh
-systemctl --user daemon-reload
-systemctl --user enable --now git-sync.timer
+## Requirements
+
+- Python 3
+- `git`
+- SSH configured for your remote (e.g. GitHub SSH keys and `ssh-agent`)
+
+## Usage
+
+Track a directory (existing repo or a plain folder):
+
+```bash
+./sync.py add ~/notes --remote git@github.com:USER/notes.git --branch main
 ```
-Ensure your chosen `BIN_DIR` (default `~/.local/bin`) is on PATH to run commands with `gitsync`.
 
-Minimal (no timer/shim; run manually):
-```sh
-chmod +x sync.py
-./sync.py run --once
+List tracked directories:
+
+```bash
+./sync.py list
 ```
 
-## Configure directories
-- Add a directory (after install you can use `gitsync` instead of `./sync.py`):
-  ```sh
-  gitsync add /path/to/dir --remote https://example.com/repo.git --branch main
-  ```
-- List tracked directories:
-  ```sh
-  gitsync list
-  ```
-- Remove a directory:
-  ```sh
-  gitsync remove /path/to/dir
-  ```
+Run one sync pass:
 
-## Run syncs
-- Single pass:
-  ```sh
-  gitsync sync
-  ```
-- Continuous (every 5 minutes by default, or override):
-  ```sh
-  gitsync run --interval 5
-  ```
-- Disable pushes for a run: add `--no-push-all`.
-- Run once then exit: add `--once` (useful in cron/systemd timers).
+```bash
+./sync.py sync
+```
 
-## Service (systemd user) example
-Use `install.sh` if you prefer not to hand-write unit files. It writes `~/.config/systemd/user/git-sync.service` and `git-sync.timer` pointing at this checkout, and drops a `gitsync` shim into `BIN_DIR` (default `~/.local/bin`). Customize `INTERVAL_MINUTES`, `PYTHON_BIN`, or `BIN_DIR` when running the script.
+Run continuously in the foreground (default interval from config):
+
+```bash
+./sync.py run
+```
+
+Run continuously in the background (daemon mode):
+
+```bash
+./sync.py run --daemon --pidfile ~/.config/git-sync/git-sync.pid --logfile ~/.config/git-sync/git-sync.log
+```
+
+Stop a daemon:
+
+```bash
+./sync.py stop --pidfile ~/.config/git-sync/git-sync.pid
+```
 
 ## Configuration
 
-Configuration is stored at `~/.config/git-sync/config.json`. You can edit this file manually or use the CLI commands.
+Config is stored at:
 
-Example config:
-```json
-{
-  "entries": [
-    {
-      "path": "/home/user/notes",
-      "remote": "https://github.com/user/notes.git",
-      "branch": "main",
-      "push": true,
-      "commit_message": "Auto-sync notes"
-    }
-  ],
-  "interval_minutes": 5,
-  "network_host": "github.com"
-}
-```
+- `~/.config/git-sync/config.json`
 
-## Notes
-- Initializes git repos if missing; commits only when there are changes; pushes when online (host check defaults to `github.com`).
-- Branch and commit message are configurable per entry; pushes can be disabled per entry or per run.
-- Minimum loop interval is 1 minute; set `INTERVAL_MINUTES` accordingly.
-- All dependencies are standard library; no external packages required.
-- Pushes perform a fetch and rebase against the configured branch before pushing to reduce divergence; repositories with local-only work may require manual conflict resolution.
+Defaults include:
+
+- `interval_minutes`: 5
+- `network_host`: `github.com`
+- `network_port`: 22
+
+`network_host` / `network_port` are used as a fallback if a tracked entry has no remote URL; when a remote is set, `git-sync` infers the SSH host/port from the remote when possible.

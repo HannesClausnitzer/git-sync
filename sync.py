@@ -8,10 +8,13 @@ Lightweight Git-based sync helper.
 
 from __future__ import annotations
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 import argparse
+import contextlib
 import json
+import os
+import signal
 import socket
 import subprocess
 import sys
@@ -19,12 +22,15 @@ import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 CONFIG_PATH = Path.home() / ".config" / "git-sync" / "config.json"
+DEFAULT_LOCK_PATH = Path.home() / ".config" / "git-sync" / "lock"
 DEFAULT_INTERVAL_MINUTES = 5
 DEFAULT_NETWORK_HOST = "github.com"
+DEFAULT_NETWORK_PORT = 22
 MIN_INTERVAL_MINUTES = 1
+DEFAULT_GIT_TIMEOUT_SECONDS = 30
 
 
 @dataclass
@@ -60,6 +66,7 @@ class Config:
     entries: List[Entry]
     interval_minutes: int
     network_host: str
+    network_port: int
 
     @classmethod
     def load(cls) -> "Config":
@@ -69,6 +76,7 @@ class Config:
                 entries=[],
                 interval_minutes=DEFAULT_INTERVAL_MINUTES,
                 network_host=DEFAULT_NETWORK_HOST,
+                network_port=DEFAULT_NETWORK_PORT,
             )
             cfg.save()
             return cfg
@@ -81,7 +89,8 @@ class Config:
             MIN_INTERVAL_MINUTES, int(data.get("interval_minutes", DEFAULT_INTERVAL_MINUTES))
         )
         host = data.get("network_host", DEFAULT_NETWORK_HOST)
-        return cls(entries=entries, interval_minutes=interval, network_host=host)
+        port = int(data.get("network_port", DEFAULT_NETWORK_PORT))
+        return cls(entries=entries, interval_minutes=interval, network_host=host, network_port=port)
 
     def save(self) -> None:
         CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
@@ -89,6 +98,7 @@ class Config:
             "entries": [e.to_dict() for e in self.entries],
             "interval_minutes": self.interval_minutes,
             "network_host": self.network_host,
+            "network_port": self.network_port,
         }
         with CONFIG_PATH.open("w", encoding="utf-8") as fh:
             json.dump(data, fh, indent=2)
@@ -102,13 +112,99 @@ def log(msg: str) -> None:
     print(f"[{ts}] {msg}", flush=True)
 
 
-def run_git(path: Path, *args: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+def run_git(
+    path: Path,
+    *args: str,
+    check: bool = True,
+    timeout_seconds: int = DEFAULT_GIT_TIMEOUT_SECONDS,
+) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", "-C", str(path), *args],
         check=check,
         text=True,
         capture_output=True,
+        timeout=timeout_seconds,
     )
+
+
+@contextlib.contextmanager
+def pid_lock(lock_path: Path) -> "contextlib.AbstractContextManager[None]":
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        try:
+            stale_pid = int(lock_path.read_text(encoding="utf-8").strip())
+        except Exception:
+            stale_pid = None
+
+        if stale_pid is not None:
+            try:
+                os.kill(stale_pid, 0)
+                raise SystemExit(f"Another git-sync instance is running (pid {stale_pid}).")
+            except ProcessLookupError:
+                # Stale lock; remove and retry once
+                with contextlib.suppress(OSError):
+                    lock_path.unlink()
+                fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+            except PermissionError:
+                raise SystemExit(
+                    f"Lockfile exists and pid {stale_pid} is not accessible; aborting."
+                )
+        else:
+            raise SystemExit(f"Lockfile exists at {lock_path}; aborting.")
+
+    try:
+        os.write(fd, str(os.getpid()).encode("utf-8"))
+        os.close(fd)
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            lock_path.unlink()
+
+
+def write_pidfile(pidfile: Optional[Path]) -> None:
+    if not pidfile:
+        return
+    pidfile.parent.mkdir(parents=True, exist_ok=True)
+    pidfile.write_text(str(os.getpid()), encoding="utf-8")
+
+
+def remove_pidfile(pidfile: Optional[Path]) -> None:
+    if not pidfile:
+        return
+    with contextlib.suppress(OSError):
+        pidfile.unlink()
+
+
+def daemonize(logfile: Optional[Path], pidfile: Optional[Path]) -> None:
+    if os.fork() > 0:
+        os._exit(0)
+    os.setsid()
+    if os.fork() > 0:
+        os._exit(0)
+
+    sys.stdin.flush()
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    devnull = os.open(os.devnull, os.O_RDONLY)
+    os.dup2(devnull, 0)
+    os.close(devnull)
+
+    if logfile:
+        logfile.parent.mkdir(parents=True, exist_ok=True)
+        out = os.open(str(logfile), os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o644)
+        os.dup2(out, 1)
+        os.dup2(out, 2)
+        os.close(out)
+    else:
+        dn = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(dn, 1)
+        os.dup2(dn, 2)
+        os.close(dn)
+
+    write_pidfile(pidfile)
 
 
 def repo_exists(path: Path) -> bool:
@@ -164,6 +260,36 @@ def has_changes(path: Path) -> bool:
     return bool(res.stdout.strip())
 
 
+def origin_branch_exists(path: Path, branch: str) -> bool:
+    res = run_git(path, "show-ref", "--verify", f"refs/remotes/origin/{branch}", check=False)
+    return res.returncode == 0
+
+
+def ahead_behind(path: Path, branch: str) -> Tuple[int, int]:
+    """Return (ahead, behind) relative to origin/branch.
+
+    If origin/branch doesn't exist, returns (0, 0).
+    """
+    if not origin_branch_exists(path, branch):
+        return (0, 0)
+    res = run_git(
+        path,
+        "rev-list",
+        "--left-right",
+        "--count",
+        f"origin/{branch}...{branch}",
+        check=False,
+    )
+    if res.returncode != 0:
+        return (0, 0)
+    left_right = res.stdout.strip().split()
+    if len(left_right) != 2:
+        return (0, 0)
+    behind = int(left_right[0])
+    ahead = int(left_right[1])
+    return (ahead, behind)
+
+
 def commit_changes(path: Path, message: str) -> bool:
     if not has_changes(path):
         return False
@@ -201,11 +327,44 @@ def rebase_onto_remote(path: Path, branch: str) -> bool:
 
 
 def online(host: str) -> bool:
+    return online_host_port(host, DEFAULT_NETWORK_PORT)
+
+
+def online_host_port(host: str, port: int) -> bool:
     try:
-        with socket.create_connection((host, 443), timeout=2):
+        with socket.create_connection((host, port), timeout=2):
             return True
     except OSError:
         return False
+
+
+def infer_ssh_target(remote: Optional[str], cfg: Config) -> Tuple[str, int]:
+    """Best-effort: infer SSH host/port from remote, else fall back to config."""
+    if not remote:
+        return (cfg.network_host, cfg.network_port)
+
+    # scp-like: git@github.com:owner/repo.git
+    if ":" in remote and "@" in remote and not remote.startswith("ssh://"):
+        try:
+            host_part = remote.split("@", 1)[1]
+            host = host_part.split(":", 1)[0]
+            return (host, DEFAULT_NETWORK_PORT)
+        except Exception:
+            return (cfg.network_host, cfg.network_port)
+
+    # ssh://user@host:port/path
+    if remote.startswith("ssh://"):
+        rest = remote[len("ssh://") :]
+        hostport = rest.split("/", 1)[0]
+        if "@" in hostport:
+            hostport = hostport.split("@", 1)[1]
+        if ":" in hostport:
+            host, port_s = hostport.rsplit(":", 1)
+            with contextlib.suppress(ValueError):
+                return (host, int(port_s))
+        return (hostport, DEFAULT_NETWORK_PORT)
+
+    return (cfg.network_host, cfg.network_port)
 
 
 # --------------------------- actions ---------------------------
@@ -267,32 +426,55 @@ def sync_entry(entry: Entry, cfg: Config, push_override: Optional[bool]) -> None
         set_branch(path, entry.branch)
         branch = entry.branch
 
-    if not has_changes(path):
-        log(f"Idle: {path}")
-        return
-
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    message = f"{entry.commit_message} ({timestamp})"
-    did_commit = commit_changes(path, message)
-    if not did_commit:
-        log(f"Nothing to commit in {path}")
-        return
-    log(f"Committed changes in {path}")
-
     if not push:
+        if has_changes(path):
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            message = f"{entry.commit_message} ({timestamp})"
+            did_commit = commit_changes(path, message)
+            if did_commit:
+                log(f"Committed changes in {path}")
+        else:
+            log(f"Idle: {path}")
         return
 
-    if not online(cfg.network_host):
-        log("Offline; will push on next run")
+    if not remote_exists(path):
+        # Still commit locally even if push enabled but remote missing
+        if has_changes(path):
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            message = f"{entry.commit_message} ({timestamp})"
+            did_commit = commit_changes(path, message)
+            if did_commit:
+                log(f"Committed changes in {path}")
+        log(f"No remote configured for {path}; skipping push")
         return
 
-    if remote_exists(path):
-        if not fetch_remote(path, branch):
-            return
+    host, port = infer_ssh_target(entry.remote, cfg)
+    if not online_host_port(host, port):
+        log(f"Offline; will push on next run ({host}:{port})")
+        return
+
+    if not fetch_remote(path, branch):
+        return
+
+    # If we have local file changes, commit them first.
+    if has_changes(path):
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        message = f"{entry.commit_message} ({timestamp})"
+        did_commit = commit_changes(path, message)
+        if did_commit:
+            log(f"Committed changes in {path}")
+
+    # Rebase if we're behind (or diverged) and then push if we're ahead.
+    ahead, behind = ahead_behind(path, branch)
+    if behind > 0:
         if not rebase_onto_remote(path, branch):
             return
+        ahead, behind = ahead_behind(path, branch)
 
-    push_changes(path, branch)
+    if ahead > 0 or not origin_branch_exists(path, branch):
+        push_changes(path, branch)
+    else:
+        log(f"Up to date: {path}")
 
 
 def sync_all(args: argparse.Namespace) -> None:
@@ -313,11 +495,54 @@ def run_loop(args: argparse.Namespace) -> None:
     if interval < MIN_INTERVAL_MINUTES:
         log(f"Interval too low ({interval}); using {MIN_INTERVAL_MINUTES} minute")
         interval = MIN_INTERVAL_MINUTES
-    while True:
-        sync_all(args)
-        if args.once:
-            return
-        time.sleep(interval * 60)
+
+    stop_flag = {"stop": False}
+
+    def _handle_signal(_signum: int, _frame: object) -> None:
+        stop_flag["stop"] = True
+
+    signal.signal(signal.SIGTERM, _handle_signal)
+    signal.signal(signal.SIGINT, _handle_signal)
+
+    lock_path = Path(args.lockfile).expanduser().resolve() if args.lockfile else DEFAULT_LOCK_PATH
+    with pid_lock(lock_path):
+        if args.daemon:
+            daemonize(
+                Path(args.logfile).expanduser().resolve() if args.logfile else None,
+                Path(args.pidfile).expanduser().resolve() if args.pidfile else None,
+            )
+            log("Started in daemon mode")
+
+        else:
+            write_pidfile(Path(args.pidfile).expanduser().resolve() if args.pidfile else None)
+
+        try:
+            while True:
+                sync_all(args)
+                if args.once or stop_flag["stop"]:
+                    return
+                time.sleep(interval * 60)
+        finally:
+            remove_pidfile(Path(args.pidfile).expanduser().resolve() if args.pidfile else None)
+
+
+def stop_daemon(args: argparse.Namespace) -> None:
+    pidfile = Path(args.pidfile).expanduser().resolve()
+    if not pidfile.exists():
+        log(f"PID file not found: {pidfile}")
+        return
+    try:
+        pid = int(pidfile.read_text(encoding="utf-8").strip())
+    except Exception:
+        log(f"Invalid PID file: {pidfile}")
+        return
+    try:
+        os.kill(pid, signal.SIGTERM)
+        log(f"Sent SIGTERM to pid {pid}")
+    except ProcessLookupError:
+        log(f"Process not found: pid {pid}")
+    except PermissionError:
+        log(f"No permission to stop pid {pid}")
 
 
 # --------------------------- cli ---------------------------
@@ -344,6 +569,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     sync_cmd = sub.add_parser("sync", help="Run one sync pass")
     sync_cmd.add_argument("--no-push-all", action="store_true", help="Disable pushes for this run")
+    sync_cmd.add_argument(
+        "--lockfile",
+        help=f"Lock file path (default: {DEFAULT_LOCK_PATH})",
+    )
     sync_cmd.set_defaults(func=sync_all)
 
     run_cmd = sub.add_parser("run", help="Run sync loop (for services)")
@@ -352,7 +581,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     run_cmd.add_argument("--no-push-all", action="store_true", help="Disable pushes for this run")
     run_cmd.add_argument("--once", action="store_true", help="Run a single pass then exit")
+    run_cmd.add_argument(
+        "--daemon",
+        action="store_true",
+        help="Detach and run in background (writes --pidfile if provided)",
+    )
+    run_cmd.add_argument("--pidfile", help="Write process PID to this file")
+    run_cmd.add_argument("--logfile", help="Append logs to this file (daemon mode)")
+    run_cmd.add_argument(
+        "--lockfile",
+        help=f"Lock file path (default: {DEFAULT_LOCK_PATH})",
+    )
     run_cmd.set_defaults(func=run_loop)
+
+    stop_cmd = sub.add_parser("stop", help="Stop a daemon started with run --daemon")
+    stop_cmd.add_argument("--pidfile", required=True, help="PID file used by the daemon")
+    stop_cmd.set_defaults(func=stop_daemon)
 
     return parser
 
@@ -360,6 +604,14 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: List[str]) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
+
+    # keep sync path locked too (single pass)
+    if args.command == "sync":
+        lock_path = Path(args.lockfile).expanduser().resolve() if args.lockfile else DEFAULT_LOCK_PATH
+        with pid_lock(lock_path):
+            args.func(args)
+        return 0
+
     args.func(args)
     return 0
 
